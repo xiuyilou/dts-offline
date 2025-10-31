@@ -5,13 +5,14 @@
 > **[DTS: Enhancing Large Reasoning Models via Decoding Tree Sketching](https://arxiv.org/abs/)**
 
 <p>
-  <a href="#updates" style="text-decoration: none; font-weight: bold;">🎉 Updates</a> •
-  <a href="#about" style="text-decoration: none; font-weight: bold;">💡 About</a> •
-  <a href="#clone-and-use-dts" style="text-decoration: none; font-weight: bold;">🔍 Clone and Use DTS</a> •
-  <a href="#running-experiments" style="text-decoration: none; font-weight: bold;">🧪 Running Experiments</a> •
-  <a href="#how-does-dts-work" style="text-decoration: none; font-weight: bold;">🚀 How does DTS Work</a> •
-  <a href="#citation" style="text-decoration: none; font-weight: bold;">💬 Citation</a>
+  <a href="#-updates" style="text-decoration: none; font-weight: bold;">🎉 Updates</a> •
+  <a href="#-about" style="text-decoration: none; font-weight: bold;">💡 About</a> •
+  <a href="#-clone-and-use-dts" style="text-decoration: none; font-weight: bold;">🔍 Clone and Use DTS</a> •
+  <a href="#-running-experiments" style="text-decoration: none; font-weight: bold;">🧪 Running Experiments</a> •
+  <a href="#-how-does-dts-work" style="text-decoration: none; font-weight: bold;">🚀 How does DTS Work</a> •
+  <a href="#-citation" style="text-decoration: none; font-weight: bold;">💬 Citation</a>
 </p>
+
 ## 🎉 Updates
 - **[2025/10/29]** Released our Paper on arXiv. See [here](https://arxiv.org/abs/).
 - **[2025/10/29]** ✨✨Full codebase of DTS released.
