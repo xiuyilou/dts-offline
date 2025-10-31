@@ -17,6 +17,15 @@
 - **[2025/10/29]** Released our Paper on arXiv. See [here](https://arxiv.org/abs/).
 - **[2025/10/29]** ✨✨Full codebase of DTS released.
 
+
+## 🎯 Paper Results
+Through DTS, we successfully achieve substantial improvements in reasoning performance and efficiency over standard inference on two key mathematical reasoning benchmarks. Our framework consistently improves **accuracy** by up to **8.0%**, reduces **average reasoning length** by over **20%** and reduces **repetition frequency** by up to **80%**. These results demonstrate that DTS effectively mitigates overthinking and generates more concise, accurate, and stable reasoning trajectories that balance performance and efficiency without any training involved. The results are presented below:
+> **Note:** All experiments were conducted on NVIDIA H200 GPUs. Results may vary slightly depending on your specific hardware configuration.
+
+<img src="./result/fig/deepseek-qwen3-7B-acc.png" alt="Alt text" width="250"><img src="./result/fig/deepseek-qwen3-7B-repetition.png" alt="Alt text" width="250"><img src="./result/fig/deepseek-qwen3-1.5B-acc.png" alt="Alt text" width="250"><img src="./result/fig/deepseek-qwen3-1.5B-repetition.png" alt="Alt text" width="250">
+
+
+
 ## 🔍 About
 
 This project introduces **DTS (Decoding Tree Sketching)**, a **training-free, model-agnostic decoding framework** designed to mitigate **overthinking** in Large Reasoning Models (LRMs).
@@ -116,14 +125,7 @@ if __name__ == "__main__":
     main()       
 ```
 
-## 🎯 Paper Results
-Through DTS, we successfully achieve substantial improvements in reasoning performance and efficiency over standard inference on two key mathematical reasoning benchmarks. Our framework consistently improves **accuracy** by up to **8.0%**, reduces **average reasoning length** by over **20%** and reduces **repetition frequency** by up to **80%**. These results demonstrate that DTS effectively mitigates overthinking and generates more concise, accurate, and stable reasoning trajectories that balance performance and efficiency without any training involved. The results are presented below:
-> **Note:** All experiments were conducted on NVIDIA H200 GPUs. Results may vary slightly depending on your specific hardware configuration.
 
-<img src="./result/fig/deepseek-qwen3-7B-acc.png" alt="Alt text" width="250">
-<img src="./result/fig/deepseek-qwen3-7B-repetition.png" alt="Alt text" width="250">
-<img src="./result/fig/deepseek-qwen3-1.5B-acc.png" alt="Alt text" width="250">
-<img src="./result/fig/deepseek-qwen3-1.5B-repetition.png" alt="Alt text" width="250">
 
 
 <!-- | Model                             | Method             |        AIME2024       |                        |                     |        AIME2025       |                        |                     |        Average        |                        |                     |
