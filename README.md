@@ -216,9 +216,9 @@ This codebase is configured to run the AIME24/AIME25 datasets with the DeepSeek-
 
 DTS selectively branches at high-uncertainty tokens and applies early stopping to identify the **most information-dense and concise reasoning path** to balance efficiency and correctness. The design of DTS is driven by two critical, empirical findings regarding LRM behavior:
 
-1.  There is a clear **anti-correlation** between reasoning length and accuracy.
+- There is a clear **anti-correlation** between reasoning length and accuracy.
 
-2. The variance in generated output is predominantly determined by **high-uncertainty (high-entropy) tokens**.
+- The variance in generated output is predominantly determined by **high-uncertainty (high-entropy) tokens**.
 
 The figure below illustrates both this anti-correlation (a) and the resulting DTS framework (b), which selectively branches at high-entropy tokens to find the shortest, most accurate path:
 <p align="center">
