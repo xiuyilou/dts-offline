@@ -212,18 +212,19 @@ This codebase is configured to run the AIME24/AIME25 datasets with the DeepSeek-
 
 ## 🔍 How does DTS Work?
 
-This project introduces **DTS (Decoding Tree Sketching)**, a **training-free, model-agnostic decoding framework** designed to mitigate **overthinking** in Large Reasoning Models (LRMs).
+<!-- This project introduces **DTS (Decoding Tree Sketching)**, a **training-free, model-agnostic decoding framework** designed to mitigate **overthinking** in Large Reasoning Models (LRMs). -->
 
 DTS selectively branches at high-uncertainty tokens and applies early stopping to identify the *"most information-dense and concise reasoning path"* — balancing efficiency and correctness.
 
 The design of DTS is driven by two critical, empirical findings regarding LRM behavior:
 
-1.  The variance in generated output is predominantly determined by **high-uncertainty (high-entropy) tokens**.
-2.  There is a clear **anti-correlation** between reasoning length and accuracy.
+1.  There is a clear **anti-correlation** between reasoning length and accuracy.
+
+2. The variance in generated output is predominantly determined by **high-uncertainty (high-entropy) tokens**.
 
 The figure below illustrates both this anti-correlation (a) and the resulting DTS framework (b), which selectively branches at high-entropy tokens to find the shortest, most accurate path：
 <p align="center">
-  <img src="assets/fig1.png" width="600">
+  <img src="assets/fig1.png" width="800">
 </p>
 
 
