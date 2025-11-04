@@ -1,15 +1,16 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer, set_seed
 from decoding_tree_sketching.kvbatch_decoder import KVBatchEGDT
+from decoding_tree_sketching.utils.eval_utils import extract_answer_llm
 
 examples = [
-    "Let $\\mathcal{B}$ be the set of rectangular boxes with surface area $54$ and volume $23$. Let $r$ be the radius of the smallest sphere that can contain each of the rectangular boxes that are elements of $\\mathcal{B}$. The value of $r^2$ can be written as $\\\frac{p}{q}$, where $p$ and $q$ are relatively prime positive integers. Find $p+q$.",
+    "Six points $A, B, C, D, E,$ and $F$ lie in a straight line in that order. Suppose that $G$ is a point not on the line and that $AC=26, BD=22, CE=31, DF=33, AF=73, CG=40,$ and $DG=30.$ Find the area of $\\triangle BGE.$",
 ]
 groundtruths = [
-    "721",
+    "468",
 ]
 reasoning_tail = r" Please reason step by step, and put your final answer within \boxed{}."
-seed = 0
+seed = 1
 
 # Replace with your model checkpoint if needed
 model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
@@ -19,7 +20,7 @@ DECODE_CONFIG = {
     "entropy_threshold": 2.5,
     "branch_top_k": 3,
     "max_active_hyps": 12,
-    "max_new_tokens": 4096,
+    "max_new_tokens": 5000,
     "temperature": 0.6,
 }
 
@@ -58,6 +59,9 @@ def main():
         temperature=DECODE_CONFIG["temperature"],    
         streamer=streamer,
     )
+    stat = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+    ans = extract_answer_llm(stat)
+    print(f"Groundtruth = {groundtruth}, Regular decoding output = {ans}")
 
     # DTS output
     dts_out = kvegdt.generate(
@@ -69,11 +73,9 @@ def main():
         temperature=DECODE_CONFIG["temperature"],
     )
     
-    print(f"*** MODEL OUTPUT ***\n{dts_out['text']}")
-    # Print generation statistics such as steps, branch events, and sequence length
     print(f"\n*** GENERATION STATS ***\n{dts_out['stats']}")
-
-    print(f"Groundtruth = {groundtruth}, Regular decoding output = {}, DTS output = {dts_out['stats']}")
+    dts_ans = extract_answer_llm(dts_out['text'])
+    print(f"Groundtruth = {groundtruth}, DTS output = {dts_ans}")
 
 if __name__ == "__main__":
     main()       
