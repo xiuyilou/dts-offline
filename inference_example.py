@@ -17,7 +17,7 @@ model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 
 # Decoding hyperparameters
 DECODE_CONFIG = {
-    "entropy_threshold": 2.5,
+    "entropy_threshold": 2,
     "branch_top_k": 3,
     "max_active_hyps": 12,
     "max_new_tokens": 5000,
