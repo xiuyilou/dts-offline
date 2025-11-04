@@ -15,9 +15,9 @@
 </p>
 
 ## 🎉 Updates
-- **[2025/10/29]** 📣 Released DTS on Colab! [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ZichengXu/Decoding-Tree-Sketching/blob/main/notebooks/example_DeepSeek_R1_Distill_Qwen_1_5B.ipynb)
-- **[2025/10/29]** 📣 Released our Paper on arXiv. See [here](https://arxiv.org/abs/).
-- **[2025/10/29]** ✨✨Full codebase of DTS released.
+- **[11/03/2025]** 📣 Released DTS on Colab! [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ZichengXu/Decoding-Tree-Sketching/blob/main/notebooks/example_DeepSeek_R1_Distill_Qwen_1_5B.ipynb)
+- **[10/29/2025]** 📣 Released our Paper on arXiv. See [here](https://arxiv.org/abs/).
+- **[10/29/2025]** ✨✨Full codebase of DTS released.
 
 
 
