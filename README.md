@@ -244,14 +244,14 @@ The figure below illustrates both this anti-correlation (a) and the resulting DT
 
 If you find DTS helpful, please cite the paper and star this repo, thanks!
 
-```bibtex
+<!-- ```bibtex
 @inproceedings{
   title={},
   author={},
   booktitle={},
   year={}
 }
-```
+``` -->
 
 
 
