@@ -239,19 +239,26 @@ The figure below illustrates both this anti-correlation (a) and the resulting DT
   <img src="assets/fig1.png" width="850">
 </p>
 
+## 🫡 Acknowledgement
+
+We also acknowledge [Entropix](https://github.com/xjdr-alt/entropix), an open-source package exploring entropy-based sampling for Chain-of-Thought (CoT) decoding. 
+
+<!-- Its work on leveraging uncertainty signals during generation is closely related to our motivation for entropy-guided reasoning efficiency. -->
+<!-- Acknowledge to [entropix], another open-source package for entropy-based sampling for CoT decoding. -->
+
 
 ## 💬 Citation
 
 If you find DTS helpful, please cite the paper and star this repo, thanks!
 
-<!-- ```bibtex
-@inproceedings{
-  title={},
-  author={},
-  booktitle={},
-  year={}
+```bibtex
+@article{xu2025dts,
+  title={DTS: Enhancing Large Reasoning Models via Decoding Tree Sketching},
+  author={Xu, Zicheng and Wang, Guanchu and Chuang, Yu-Neng and Zheng, Guangyao and Szalay, Alexander S and Liu, Zirui and Braverman, Vladimir},
+  journal={arXiv preprint arXiv:2511.00640},
+  year={2025}
 }
-``` -->
+```
 
 
 
