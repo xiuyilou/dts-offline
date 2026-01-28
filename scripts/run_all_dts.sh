@@ -28,10 +28,6 @@ for model in "${MODELS[@]}"; do
       local_temp=0.5
     elif [ "$dataset" == "gpqa_diamond" ]; then
       local_temp=0.6
-    elif [ "$dataset" == "MATH500" ]; then
-      local_temp=0.6
-    elif [ "$dataset" == "mmlu_pro" ]; then
-      local_temp=0.6
     elif [ "$dataset" == "livebench_reasoning" ]; then
       local_temp=0.6
     else
@@ -56,8 +52,6 @@ for model in "${MODELS[@]}"; do
           -s "$seed" \
           -n "$TRIALS" \
           --num_traces "$num_traces" \
-          --early_stop_min_ratio "$EARLY_MIN_RATIO" \
-          --early_stop_patience "$EARLY_PATIENCE" \
           --online_voting_mode "$ONLINE_VOTING_MODE"
 
         echo "--- [DTS] Finished: $model, $dataset, seed=$seed, num_traces=$num_traces ---"
