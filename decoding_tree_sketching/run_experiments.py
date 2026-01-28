@@ -1,9 +1,11 @@
+
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import time, json
 import torch
 import numpy as np
 import random
 import sys
-import os
 import re
 import argparse
 from pathlib import Path
@@ -22,6 +24,9 @@ from sklearn.metrics import accuracy_score
 from tqdm import tqdm
 import tiktoken
 import accelerate
+from typing import List, Optional, Dict, Any, Callable
+from collections import Counter
+import math 
 
 from decoding_tree_sketching.utils.eval_utils import extract_answer_llm, extract_answer_qwq, is_float
 from decoding_tree_sketching.kvbatch_decoder import KVBatchEGDT
@@ -30,25 +35,78 @@ def fmt_float(x: float) -> str:
     s = f"{x:.6f}".rstrip("0").rstrip(".")
     return s.replace(".", "p") if s else "0"
 
-def extract_answer_gsm8k(text: str):
-    """
-    Extract numeric final answer from GSM8K format, e.g. '...#### 42' -> '42'.
-    """
-    if text is None:
+def extract_livebench_answer(text: str) -> Optional[str]:
+    if not text:
         return None
     
-    # CORRECTED REGEX: Look for the '####' marker followed by the number
-    m = re.search(r'####\s*(\-?[0-9\.\,]+)', text)
-    
-    if m:
-        # Found the marker, extract the number
-        match_str = m.group(1).strip()
-        match_str = match_str.replace(",", "")
-        return match_str
-    else:
-        # If the marker isn't found, the GT format is unexpected
-        return None
+    solution_matches = re.findall(r"<solution>(.*?)</solution>", text, re.DOTALL | re.IGNORECASE)
+    if solution_matches:
+        return solution_matches[-1].strip()
 
+    boxed_matches = re.findall(r"\\boxed\{(.*?)\}", text)
+    if boxed_matches:
+        return boxed_matches[-1].strip()
+
+    bold_matches = re.findall(r"\*{2,}(.*?)\*{2,}", text, re.DOTALL)
+    if bold_matches:
+        return bold_matches[-1].strip().strip('*')
+
+    lines = text.strip().split('\n')
+    for line in reversed(lines):
+        ans_match = re.search(r"(?:^|\.\s*|The\s+)(?:Answer|answer)\s*(?:is|:)\s*(.*?)(?:\.|$)", line, re.IGNORECASE)
+        if ans_match:
+            candidate = ans_match.group(1).strip()
+            if len(candidate) < 100:
+                return candidate
+    try:
+        num_ans = extract_answer_llm(text)
+        if num_ans: 
+            return num_ans
+    except:
+        pass
+    
+    return None
+
+def check_livebench_match(model_ans, gt_ans):
+    def normalize_list(s):
+        if s is None: return []
+        s = str(s).replace("<solution>", "").replace("</solution>", "")
+        s = s.replace("\n", ",")
+        items = [item.strip() for item in s.split(",") if item.strip()]
+        return [i.lower() for i in items]
+
+    normalized_model = normalize_list(model_ans)
+    normalized_gt = normalize_list(gt_ans)
+    return normalized_model == normalized_gt
+    
+QUERY_TEMPLATE_MULTICHOICE = """
+Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD. Think step by step before answering.
+
+{Question}
+
+A) {A}
+B) {B}
+C) {C}
+D) {D}
+""".strip()
+
+ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer\s*:\s*\$?([A-D])\$?"
+
+def extract_gpqa_answer(text: str) -> Optional[str]:
+    if not text:
+        return None
+    
+    lines = text.strip().split('\n')
+    for line in reversed(lines):
+        match = re.search(ANSWER_PATTERN_MULTICHOICE, line)
+        if match:
+            return match.group(1).upper()
+            
+    all_matches = re.findall(r"\b([A-D])\b", text)
+    if all_matches:
+        return all_matches[-1].upper()
+        
+    return None
 
 def main():
     parser = argparse.ArgumentParser(
@@ -63,9 +121,9 @@ def main():
     )
 
     # --- Config Selection Arguments ---
-    parser.add_argument("--model_name", type=str, default="1.5B", choices=["1.5B", "7B", "phi-4-mini-reasoning"],
+    parser.add_argument("--model_name", type=str, default="1.5B", choices=["1.5B", "7B", "phi-4-mini-reasoning", "qwen30p6"],
                         help="Model configuration key from configs/config.yaml (e.g., '1.5B')")
-    parser.add_argument("--dataset_name", type=str, default="aime24", choices=["aime24", "aime25", "GSM8K", "gpqa_diamond"],
+    parser.add_argument("--dataset_name", type=str, default="aime24", choices=["aime24", "aime25", "gpqa_diamond", "livebench_reasoning"],
                         help="Dataset configuration key from configs/config.yaml (e.g., 'aime24')")
     parser.add_argument("--config_file", type=str, default="configs/config.yaml",
                         help="Path to the experiment configuration file")
@@ -87,9 +145,19 @@ def main():
                         help="Initial random seed")
     parser.add_argument("-n", "--num_trials", type=int, default=5,
                         help="Number of trials for the repeated experiment")
-    parser.add_argument("--tag", type=str, default="fast@12",
+    parser.add_argument("--tag", type=str, default="online",
                         help="Optional tag to append to the output filename (before .json)")
+    
+    parser.add_argument("--early_stop_min_ratio", type=float, default=0.8,
+                        help="[DTS only] Early-stop when some answer's freq >= this ratio over finished traces")
+    parser.add_argument("--early_stop_patience", type=int, default=4,
+                        help="[DTS only] Early-stop only after at least this many finished traces")
 
+    parser.add_argument("--online_voting_mode", type=str, default="majority",
+                        choices=["majority", "iew"],
+                        help="[DTS only] Voting mode for aggregating traces at the end")
+    parser.add_argument("--num_traces", type=int, default=8,
+                        help="[DTS only] Maximum number of traces to collect per question")
     args = parser.parse_args()
 
     # --- 1. Load Config File ---
@@ -148,7 +216,7 @@ def main():
         trust_remote_code=True,
     )
 
-
+    print("model.dtype:", model.dtype)
     # --- 3. Load Dataset (from Config) ---
     dataset_name_hf = dataset_config["dataset_name"]
     dataset_split = dataset_config.get("split", "train")
@@ -157,9 +225,7 @@ def main():
     answer_key = dataset_config.get("answer_key", "Answer") 
 
     print(f"Loading dataset: {dataset_name_hf} (split: {dataset_split})...")
-    if dataset_name_hf == "openai/gsm8k":
-        test_examples = load_dataset(dataset_name_hf, "main", split=dataset_split)
-    elif dataset_name_hf == "Idavidrein/gpqa":
+    if dataset_name_hf == "Idavidrein/gpqa":
         test_examples = load_dataset(dataset_name_hf, "gpqa_diamond", split=dataset_split)
     else:
         test_examples = load_dataset(dataset_name_hf, split=dataset_split)
@@ -172,6 +238,86 @@ def main():
     all_token_num = []
     all_branch_events = []
     all_detailed_candidates_only = []
+    
+        # ========== Online answer extractor & voting helpers ==========
+
+    def online_answer_extractor(text: str) -> str:
+        if args.dataset_name in ["aime24", "aime25"]:
+            ans = extract_answer_qwq(text)
+            if not ans:
+                ans = extract_answer_llm(text)
+            return ans or ""
+        elif args.dataset_name == "gpqa_diamond":
+            return extract_gpqa_answer(text) or ""
+        elif args.dataset_name == "livebench_reasoning":
+            return extract_livebench_answer(text) or ""
+        else:
+            return text.strip()
+
+    def compute_chain_entropy_from_trace(tr: Dict[str, Any]) -> float:
+        tm_list = tr.get("token_metrics") or []
+        ent_list = []
+        for tm in tm_list:
+            if isinstance(tm, dict) and ("entropy" in tm) and tm["entropy"] is not None:
+                ent_list.append(float(tm["entropy"]))
+        if ent_list:
+            return float(np.mean(ent_list))
+
+        ent_hist = tr.get("entropy_history") or []
+        if ent_hist:
+            arr = np.array(ent_hist, dtype=float)
+            if arr.size > 0:
+                return float(arr.mean())
+
+        return float("nan")
+
+    def online_majority_vote(traces: List[Dict[str, Any]]) -> Optional[str]:
+        answers = [tr.get("answer") for tr in traces if tr.get("finished") and tr.get("answer")]
+        if not answers:
+            return None
+        cnt = Counter(answers)
+        winner, _ = cnt.most_common(1)[0]
+        return winner
+
+    def online_iew_vote(traces: List[Dict[str, Any]], eps: float = 1e-10) -> Optional[str]:
+        valid = [tr for tr in traces if tr.get("answer")]
+        if not valid:
+            return None
+
+        H_list = [compute_chain_entropy_from_trace(tr) for tr in valid]
+        finite_H = [H for H in H_list if np.isfinite(H)]
+        if not finite_H:
+            return online_majority_vote(valid)
+
+        mean_H = float(np.mean(finite_H))
+        H_filled = [H if np.isfinite(H) else mean_H for H in H_list]
+
+        w = []
+        for H in H_filled:
+            H_clamped = max(H, eps)
+            w.append(1.0 / H_clamped)
+
+        if not any(np.isfinite(w_i) for w_i in w) or sum(w) <= 0:
+            w = [1.0 for _ in w]
+
+        w_sum = float(sum(w))
+        W_norm = [wi / w_sum for wi in w]
+
+        answer_weights: Dict[str, float] = {}
+        for tr, wi in zip(valid, W_norm):
+            a = tr.get("answer")
+            answer_weights[a] = answer_weights.get(a, 0.0) + float(wi)
+
+        if not answer_weights:
+            return None
+        winner, _ = max(answer_weights.items(), key=lambda kv: kv[1])
+        return winner
+
+    def online_get_winner(traces: List[Dict[str, Any]], mode: str = "majority") -> Optional[str]:
+        if mode == "iew":
+            return online_iew_vote(traces)
+        return online_majority_vote(traces)
+       
     # --- 4. Run Trials Loop ---
     for s in seeds:
         print(f"\n--- Running Trial with Seed {s} ---")
@@ -182,23 +328,26 @@ def main():
         all_responses = []
         all_stats = []
         gt_answers =[]
+        selected_indices = []
         
         torch.cuda.synchronize()
         t0 = time.time()
-
+        target_indices = set(range(test_examples))
+        print(f"Using {len(target_indices)} target indices out of {len(test_examples)} examples.")
         if args.mode == "dts":
             kvegdt = KVBatchEGDT(model, tokenizer, seed=s)
             
             random.seed(s) 
-            np.random.seed(s)
-            
-            target_indices = {0,3,7,16,20,21,6,10,13,17,23,27,8,19,26}
+            np.random.seed(s)   
             for index, example in enumerate(test_examples):
                 if index in target_indices:
                     
                     prompt_content = ""
-                    
-                    if args.dataset_name == "gpqa_diamond":
+                    if args.dataset_name == "livebench_reasoning":
+                        prompt_content = str(example[prompt_key][0])
+                        gt_answers.append(str(example[answer_key]))
+                        
+                    elif args.dataset_name == "gpqa_diamond":
                         question_text = example[prompt_key]
                         correct_opt = example[answer_key]
                         
@@ -227,7 +376,13 @@ def main():
                         formatted_options = [f"{['A', 'B', 'C', 'D'][i]}. {opt}" for i, opt in enumerate(options)]
                         options_str = "\n".join(formatted_options)
                         
-                        prompt_content = f"{question_text}\n\n{options_str}\n\n{prompt_tail}"
+                        prompt_content = QUERY_TEMPLATE_MULTICHOICE.format(
+                            Question=question_text,
+                            A=options[0],
+                            B=options[1],
+                            C=options[2],
+                            D=options[3]
+                        )
                     
                     else:
                         prompt_content = example[prompt_key] + prompt_tail
@@ -235,20 +390,25 @@ def main():
 
                     messages = [{"role": "user", "content": prompt_content}]
                     text = tokenizer.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True
+                        messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
                     )
 
                     out = kvegdt.generate(
                         text,
-                        entropy_threshold=args.entropy_threshold,    
-                        branch_top_k=args.branch_top_k,          
-                        max_active_hyps=args.max_active_hyps,      
+                        entropy_threshold=args.entropy_threshold,
+                        branch_top_k=args.branch_top_k,
+                        max_active_hyps=args.max_active_hyps,
                         max_new_tokens=args.max_new_tokens,
                         temperature=args.temperature,
                         stop_strs=None,
                         prefer_greedy_when_confident=False,
-                        num_traces=12,
+                        num_traces=args.num_traces,
+                        early_stop_min_ratio=args.early_stop_min_ratio,
+                        early_stop_patience=args.early_stop_patience,
+                        answer_extractor=online_answer_extractor,
                     )
+
+
                     
                     traces = out.get("traces", [])
                     global_stats = out.get("stats", {})
@@ -260,26 +420,41 @@ def main():
                         best_text = ""
                         best_tokens = []
                         best_reward = None
+                        winner_answer = None
                     else:
-                        cand_texts = [tr["text"] for tr in traces]
+                        for tr in traces:
+                            ans = online_answer_extractor(tr["text"])
+                            tr["answer"] = ans
+         
+                        winner_answer = online_get_winner(traces, mode=args.online_voting_mode)
 
                         for tr in traces:
                             all_traces_info.append({
                                 "text": tr["text"],
+                                "answer": tr.get("answer", None),
                                 "token_count": len(tr["tokens"]),
                                 "logprob": tr["logprob"],
-                                "reward_score": None,
                                 "entropy_history": tr.get("entropy_history", []),
                                 "varentropy_history": tr.get("varentropy_history", []),
                                 "token_metrics": tr.get("token_metrics", []),
-                                "branch_steps": tr.get("branch_steps", []),
+                                "answer_vote_key": tr.get("answer", None),
                             })
 
-
-                        best_trace = max(traces, key=lambda tr: tr["logprob"])
-                        best_text = best_trace["text"]
-                        best_tokens = best_trace["tokens"]
-                        best_reward = None
+                        best_trace = None
+                        if winner_answer:
+                            for tr in traces:
+                                if tr.get("answer") == winner_answer:
+                                    best_trace = tr
+                                    break
+                        if best_trace is None and len(traces) > 0:
+                            best_trace = traces[0]
+                        
+                        if best_trace:
+                            best_text = best_trace["text"]
+                            best_tokens = best_trace["tokens"]
+                        else:
+                            best_text = ""
+                            best_tokens = []
 
                     gen_len = len(best_tokens)
                     branch_ev = global_stats.get("branch_events", 0)
@@ -290,13 +465,12 @@ def main():
                     all_stats.append({
                         "generated_len": gen_len,
                         "branch_events": branch_ev,
-                        "reward_score": best_reward,
                         "num_candidates": num_candidates,  
                         "total_branches_created": global_stats.get("total_branches_created", None),
                         "all_candidate_traces": all_traces_info,
                         "all_token_metrics": all_token_metrics 
                     })
-
+                    selected_indices.append(index)
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
 
@@ -308,111 +482,109 @@ def main():
                 torch.cuda.manual_seed_all(s)
             set_seed(s) 
             
-            for example in tqdm(test_examples, desc=f"Std. Gen (Seed {s})"):
-                
-                prompt_content = ""
-                
-                if args.dataset_name == "gpqa_diamond":
-                    question_text = example[prompt_key]
-                    correct_opt = example[answer_key]
+            # target_indices = set(range(len(test_examples)))
+            for index, example in enumerate(test_examples):
+                if index in target_indices:    
+                    prompt_content = ""
                     
-                    options = [
-                        example[answer_key], 
-                        example["Incorrect Answer 1"],
-                        example["Incorrect Answer 2"],
-                        example["Incorrect Answer 3"]
-                    ]
-                    
-                    options = [str(opt).strip() if opt is not None else "" for opt in options]
-                    correct_opt_cleaned = str(correct_opt).strip()
-
-
-                    random.shuffle(options)
-                    
-                    try:
-                        correct_index = options.index(correct_opt_cleaned)
-                    except ValueError:
-                        print(f"Error: Correct answer '{correct_opt_cleaned}' not found in options list: {options}")
-                        continue 
+                    if args.dataset_name == "gpqa_diamond":
+                        question_text = example[prompt_key]
+                        correct_opt = example[answer_key]
                         
-                    correct_letter_gt = ['A', 'B', 'C', 'D'][correct_index]
+                        options = [
+                            example[answer_key], 
+                            example["Incorrect Answer 1"],
+                            example["Incorrect Answer 2"],
+                            example["Incorrect Answer 3"]
+                        ]
+                        
+                        options = [str(opt).strip() if opt is not None else "" for opt in options]
+                        correct_opt_cleaned = str(correct_opt).strip()
+
+
+                        random.shuffle(options)
+                        
+                        try:
+                            correct_index = options.index(correct_opt_cleaned)
+                        except ValueError:
+                            print(f"Error: Correct answer '{correct_opt_cleaned}' not found in options list: {options}")
+                            continue 
+                            
+                        correct_letter_gt = ['A', 'B', 'C', 'D'][correct_index]
+                        
+                        gt_answers.append(correct_letter_gt)
+                        
+                        prompt_content = QUERY_TEMPLATE_MULTICHOICE.format(
+                            Question=question_text,
+                            A=options[0],
+                            B=options[1],
+                            C=options[2],
+                            D=options[3]
+                        )
+                    elif args.dataset_name == "livebench_reasoning":
+                        prompt_content = str(example[prompt_key][0])
+                        gt_answers.append(str(example[answer_key]))
+                    else:
+
+                        prompt_content = example[prompt_key] + prompt_tail
+                        gt_answers.append(example[answer_key])
+
+                    messages = [{"role": "user", "content": prompt_content}]
+                    text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+
+                    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=args.max_new_tokens,
+                        do_sample=True,    
+                        temperature=args.temperature,    
+                    )
                     
-                    gt_answers.append(correct_letter_gt)
+                    num_new_tokens = outputs[0].shape[0] - inputs["input_ids"].shape[1]
+                    gen = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
                     
-                    formatted_options = [f"{['A', 'B', 'C', 'D'][i]}. {opt}" for i, opt in enumerate(options)]
-                    options_str = "\n".join(formatted_options)
-                    
-                    prompt_content = f"{question_text}\n\n{options_str}\n\n{prompt_tail}"
-                
-                else:
-
-                    prompt_content = example[prompt_key] + prompt_tail
-                    gt_answers.append(example[answer_key])
-
-                messages = [{"role": "user", "content": prompt_content}]
-                text = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-
-                inputs = tokenizer(text, return_tensors="pt").to(model.device)
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=True,    
-                    temperature=args.temperature,    
-                )
-                
-                num_new_tokens = outputs[0].shape[0] - inputs["input_ids"].shape[1]
-                gen = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-                
-                all_responses.append(gen)
-                all_stats.append({
-                    'generated_len': num_new_tokens,
-                    'branch_events': 0
-                })
-
+                    all_responses.append(gen)
+                    all_stats.append({
+                        'generated_len': num_new_tokens,
+                        'branch_events': 0
+                    })
+                    selected_indices.append(index)
         # --- 5. Process Responses (Shared) ---
-        sorted_indices = sorted(list(target_indices))
+        sorted_indices = sorted(selected_indices)
         print("Evaluating responses...")
         for i, real_idx in enumerate(sorted_indices):
             response = all_responses[i]
             stat = all_stats[i]
             
             gt_raw = gt_answers[i]
-            if "openai/gsm8k" in dataset_name_hf.lower():
-                gt_answer = extract_answer_gsm8k(gt_raw)
-            else:
-                gt_answer = str(gt_raw) 
-
-            llm_answer = extract_answer_qwq(response)
-            if not llm_answer:
-                 llm_answer = extract_answer_llm(response)
-
-            accept = False
-            
             if args.dataset_name == "gpqa_diamond":
-                clean_llm_ans = None
-                clean_gt_ans = None
+                llm_answer = extract_gpqa_answer(response)
+                gt_answer = str(gt_raw).strip().upper() 
                 
-                if llm_answer:
-                    clean_llm_ans = llm_answer.strip().strip('.').upper()
-                if gt_answer:
-                    clean_gt_ans = gt_answer.strip().strip('.').upper()
-                
-                if clean_llm_ans and clean_gt_ans:
-                    if clean_gt_ans in ['A', 'B', 'C', 'D'] and clean_llm_ans == clean_gt_ans:
-                        accept = True
-                
-                llm_answer = clean_llm_ans
-                gt_answer = clean_gt_ans
-
+                accept = (llm_answer == gt_answer)
+            elif args.dataset_name == "livebench_reasoning":
+                gt_answer = str(gt_raw)
+                llm_answer = extract_livebench_answer(response)
+                accept = check_livebench_match(llm_answer, gt_answer)
             else:
-                if is_float(gt_answer) and is_float(llm_answer):
-                    try:
-                        accept = ( int(round(float(gt_answer))) == int(round(float(llm_answer))) )
-                    except (OverflowError, ValueError):
-                        accept = False
-            
+                if args.dataset_name in ["aime24", "aime25"]:
+                    gt_answer = str(gt_raw)
+                    llm_answer = extract_answer_qwq(response)
+                    if not llm_answer:
+                        llm_answer = extract_answer_llm(response)
+                    accept = False
+                    if is_float(gt_answer) and is_float(llm_answer):
+                        try:
+                            accept = (int(round(float(gt_answer))) == int(round(float(llm_answer))))
+                        except Exception:
+                            accept = False
+                else:
+                    gt_answer = str(gt_raw)
+                    llm_answer = extract_answer_qwq(response) or extract_answer_llm(response) or ""
+                    accept = (llm_answer.strip() == gt_answer.strip())
+
             if accept:
                 correct += 1
             
@@ -421,32 +593,22 @@ def main():
             if candidate_traces:
                 for cand in candidate_traces:
                     cand_text = cand["text"]
-                    
-                    cand_llm_answer = extract_answer_qwq(cand_text)
-                    if not cand_llm_answer:
-                        cand_llm_answer = extract_answer_llm(cand_text)
-
-                    cand_accept = False
-                    cand_gt_answer = gt_answer  
-
                     if args.dataset_name == "gpqa_diamond":
-                        cand_clean_llm = cand_llm_answer.strip().strip('.').upper() if cand_llm_answer else None
-                        cand_clean_gt = cand_gt_answer.strip().strip('.').upper() if cand_gt_answer else None
-
-                        if cand_clean_llm and cand_clean_gt:
-                            if cand_clean_gt in ['A', 'B', 'C', 'D'] and cand_clean_llm == cand_clean_gt:
-                                cand_accept = True
-
-                        cand_llm_answer = cand_clean_llm
-                        cand_gt_answer = cand_clean_gt
+                        cand_llm_answer = extract_gpqa_answer(cand_text)
+                        cand_gt_answer = gt_answer
+                        cand_accept = (cand_llm_answer == cand_gt_answer)
+                    elif args.dataset_name == "livebench_reasoning":
+                        cand_gt_answer = gt_answer
+                        cand_llm_answer = extract_livebench_answer(cand_text)
+                        cand_accept = check_livebench_match(cand_llm_answer, cand_gt_answer)
                     else:
+                        cand_llm_answer = extract_answer_qwq(cand_text) or extract_answer_llm(cand_text)
+                        cand_gt_answer = gt_answer
+                        cand_accept = False
                         if is_float(cand_gt_answer) and is_float(cand_llm_answer):
                             try:
-                                cand_accept = (
-                                    int(round(float(cand_gt_answer)))
-                                    == int(round(float(cand_llm_answer)))
-                                )
-                            except (OverflowError, ValueError):
+                                cand_accept = (int(round(float(cand_gt_answer))) == int(round(float(cand_llm_answer))))
+                            except:
                                 cand_accept = False
 
                     detailed_candidates.append({
@@ -455,13 +617,12 @@ def main():
                         "llm_answer": cand_llm_answer,
                         "accept": cand_accept,
                         "llm_response": cand_text,
-                        "tokens": cand.get("token_count", None),  
-                        "branch_events": len(cand.get("branch_steps", [])),  
-                        "entropy_history": cand.get("entropy_history", []),
-                        "varentropy_history": cand.get("varentropy_history", []),
-                        "token_metrics": cand.get("token_metrics", []),
-                        "branch_steps": cand.get("branch_steps", []),
+                        "tokens": cand.get("token_count", None),
+                        "logprob": cand.get("logprob", None),             
+                        "pred_answer_raw": cand.get("answer", None),      
+                        "branch_events": len(cand.get("branch_steps", [])),
                     })
+
 
                 slim_candidates = []
                 for cand_item in detailed_candidates:
@@ -493,8 +654,7 @@ def main():
                 "num_candidates": stat.get("num_candidates", None), 
                 "total_branches_created": stat.get("total_branches_created", None),
                 "all_candidate_traces": detailed_candidates,
-                "all_token_metrics": stat.get("all_token_metrics", []),
-            })
+                })
 
             num_tokens += stat['generated_len']
             branch_events += stat['branch_events']
@@ -529,14 +689,19 @@ def main():
 
     # Dynamic filename based on args
     base_fname = f"{args.dataset_name}_{args.mode}_{args.model_name}"
-    
+
     if args.mode == 'dts':
         dts_params = (
-            f"_entro{fmt_float(args.entropy_threshold)}"
-            f"_k{args.branch_top_k}"
-            f"_max_active_hyps{args.max_active_hyps}"
+            f"_entro{fmt_float(args.entropy_threshold)}"          
+            f"_k{args.branch_top_k}"                              
+            f"_max_active_hyps{args.max_active_hyps}"             
+            f"_traces{args.num_traces}"                           
+            f"_early{fmt_float(args.early_stop_min_ratio)}"       
+            f"_pat{args.early_stop_patience}"                     
+            f"_vote{args.online_voting_mode}"                     
         )
         base_fname += dts_params
+
 
     common_params_list = [
         f"_temp{fmt_float(args.temperature)}",
@@ -560,13 +725,6 @@ def main():
 
     print(f"\nSaved final results to: {out_path}")
     print(f"Final Avg Accuracy: {final_accuracy:.4f}")
-
-    if args.mode == "dts":
-        cand_fname = fname.replace(".json", "_candidates_aime25_1.5b.json")
-        cand_out_path = out_dir / cand_fname
-        with open(cand_out_path, "w", encoding="utf-8") as f:
-            json.dump(all_detailed_candidates_only, f, ensure_ascii=False, indent=2)
-        print(f"Saved candidates-only results to: {cand_out_path}")
 
 if __name__ == "__main__":
     main()
