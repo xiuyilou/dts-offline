@@ -1,9 +1,10 @@
-
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable  
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
+from collections import Counter          
+import math
 
 try:
     from transformers.cache_utils import DynamicCache
@@ -21,36 +22,88 @@ class Hyp:
     varentropies: List[float] = field(default_factory=list)
     token_metrics: List[Dict[str, float]] = field(default_factory=list)
     branch_steps: List[int] = field(default_factory=list)
+    answer: Optional[str] = None
 
 def token_entropy_from_logits(logits: torch.Tensor, temperature: float = 1.0):
-    """
-    MODIFIED: Now also returns 'p' (the probability distribution)
-    """
     if logits.dim() == 2:
         logits = logits[-1]
     scaled = logits / temperature
     logp = F.log_softmax(scaled, dim=-1)
     p = logp.exp()
     H = -(p * logp).sum().item()
-    return H, logp, p # <-- MODIFIED: return p
+    return H, logp, p
 
 def token_varentropy_from_p(p: torch.Tensor, logp: torch.Tensor, H: float) -> float:
-    """
-    NEW (Replaces token_variance_from_p): 
-    Calculates Varentropy (Variance of Information Content) in NATS^2.
-
-    Var(I(X)) = E[ (I(X) - H(X))^2 ]
-    where:
-    - I(X) = -log_e(p)   (Information content in nats)
-    - H(X) = E[I(X)]       (Entropy H, already calculated in nats)
-    
-    We have logp = log_e(p), so I(X) = -logp.
-    The calculation is: sum( p * (-logp - H)^2 )
-    """
     # I(x_i) = -logp
     # (I(X) - H(X))^2 = (-logp - H)**2s
     vent = (p * (-logp - H)**2).sum().item()
     return vent
+
+def chain_entropy_from_hyp(h: Hyp) -> float:
+    if not h.entropies:
+        return float("nan")
+    return float(sum(h.entropies) / len(h.entropies))
+
+
+def majority_vote_answers(hyps: List[Hyp]) -> Optional[str]:
+    answers = [h.answer for h in hyps if h.answer is not None and h.answer != ""]
+    if not answers:
+        return None
+    cnt = Counter(answers)
+    winner, _ = cnt.most_common(1)[0]
+    return winner
+
+
+def inverse_entropy_weighted_vote_hyps(hyps: List[Hyp], eps: float = 1e-10) -> Optional[str]:
+
+    valid = [h for h in hyps if h.answer is not None and h.answer != ""]
+    if not valid:
+        return None
+
+    H_list = []
+    for h in valid:
+        H = chain_entropy_from_hyp(h)
+        H_list.append(H)
+
+    finite_H = [H for H in H_list if math.isfinite(H)]
+    if not finite_H:
+        return majority_vote_answers(valid)
+
+    mean_H = sum(finite_H) / len(finite_H)
+    H_filled = []
+    for H in H_list:
+        if not math.isfinite(H):
+            H_filled.append(mean_H)
+        else:
+            H_filled.append(H)
+
+    weights = []
+    for H in H_filled:
+        H_clamped = max(H, eps)
+        weights.append(1.0 / H_clamped)
+
+    if not any(math.isfinite(w) for w in weights) or sum(weights) <= 0:
+        weights = [1.0 for _ in weights]
+
+    W_sum = sum(weights)
+    W_norm = [w / W_sum for w in weights]
+
+    answer_weights: Dict[str, float] = {}
+    for h, w in zip(valid, W_norm):
+        a = h.answer
+        answer_weights[a] = answer_weights.get(a, 0.0) + float(w)
+
+    if not answer_weights:
+        return None
+
+    winner, _ = max(answer_weights.items(), key=lambda kv: kv[1])
+    return winner
+
+
+def get_winner_hyps(hyps: List[Hyp], voting_mode: str = "iew") -> Optional[str]:
+    if voting_mode == "majority":
+        return majority_vote_answers(hyps)
+    return inverse_entropy_weighted_vote_hyps(hyps)
 
 def _tuple_to_dynamic_cache(pkv_tuple):
     if DynamicCache is None:
@@ -142,14 +195,11 @@ class KVBatchEGDT:
         self,
         prompt: str,
         *,
-        entropy_threshold: float = 3.5,
+        entropy_threshold: float = 2.5,
         varentropy_threshold: float = 1.5,
         branch_top_k: int = 3,
         max_new_tokens: int = 256,
         max_active_hyps: int = 36,
-        max_hyps_decay_interval: int = 0,
-        max_hyps_decay_amount: int = 0,
-        max_hyps_min: int = 0,
         length_penalty: float = 0.0,
         entropy_temp: float = 0.6,
         temperature: float = 1.0,
@@ -157,6 +207,11 @@ class KVBatchEGDT:
         stop_strs: Optional[List[str]] = None,
         prefer_greedy_when_confident: bool = False,
         num_traces: int = 5,
+        early_stop_min_ratio: float = 0.8,     
+        early_stop_patience: int = 4,           
+        early_stop_voting_mode: str = "majority",    
+        answer_extractor: Optional[Callable[[str], str]] = None,  
+        answer_equal_fn: Optional[Callable[[str, str], bool]] = None,
     ) -> Dict[str, Any]:
         tok, device = self.tok, self.device
 
@@ -195,6 +250,8 @@ class KVBatchEGDT:
         frozen = False
 
         all_token_metrics: List[tuple[float, float]] = []
+        early_stop_triggered = False
+        early_stop_info: Dict[str, Any] = {}
 
         def decode_text(ids: List[int], skip_special_tokens=True) -> str:
             return tok.decode(ids, skip_special_tokens=skip_special_tokens)
@@ -204,6 +261,67 @@ class KVBatchEGDT:
                 return False
             decoded_text = decode_text(ids, skip_special_tokens=False)
             return any(s in decoded_text for s in stop_strs)
+
+        def should_run_early_stop() -> bool:
+            return (
+                early_stop_min_ratio > 0.0
+                and early_stop_patience > 0
+                and answer_extractor is not None
+            )
+
+        def try_update_early_stop() -> bool:
+
+            nonlocal early_stop_triggered, early_stop_info
+
+            if not should_run_early_stop():
+                return False
+
+            answers = [h.answer for h in finished if h.answer is not None and h.answer != ""]
+            total = len(answers)
+            if total < early_stop_patience:
+                return False
+
+            clusters: List[Dict[str, Any]] = []
+
+            for ans in answers:
+                placed = False
+                if answer_equal_fn is not None:
+                    for c in clusters:
+                        try:
+                            eq = answer_equal_fn(ans, c["repr"])
+                        except Exception:
+                            eq = (ans == c["repr"])
+                        if eq:
+                            c["count"] += 1
+                            placed = True
+                            break
+                else:
+                    for c in clusters:
+                        if ans == c["repr"]:
+                            c["count"] += 1
+                            placed = True
+                            break
+
+                if not placed:
+                    clusters.append({"repr": ans, "count": 1})
+
+            if not clusters:
+                return False
+
+            winner_cluster = max(clusters, key=lambda c: c["count"])
+            winner = winner_cluster["repr"]
+            cnt_w = winner_cluster["count"]
+            ratio = cnt_w / total if total > 0 else 0.0
+
+            if ratio >= early_stop_min_ratio:
+                early_stop_triggered = True
+                early_stop_info = {
+                    "winner_answer": winner,
+                    "winner_ratio": ratio,
+                    "num_finished_for_vote": total,
+                }
+                return True
+            return False
 
         def prune(hyps: List[Hyp], current_max_hyps: int) -> List[Hyp]:
             if len(hyps) <= current_max_hyps:
@@ -215,7 +333,7 @@ class KVBatchEGDT:
             return scored[:current_max_hyps]
 
         steps = 0
-        # current_max_hyps_dynamic = max_active_hyps
+        
         for _ in tqdm(range(max_new_tokens), desc="Decoding"):
             steps += 1
 
@@ -255,8 +373,6 @@ class KVBatchEGDT:
                 if not frozen and current_total_hyps >= max_active_hyps:
                     frozen = True
 
-                new_branch_steps_for_children = list(h.branch_steps)
-
                 if frozen:
                     if prefer_greedy_when_confident:
                         maxv = torch.max(logp_T)
@@ -268,15 +384,12 @@ class KVBatchEGDT:
                         cand_ids = [tid]
 
                 else:
-                    is_high_entropy = (H > entropy_threshold)
                     is_low_entropy_high_varentropy = (H <= entropy_threshold) and (vent > varentropy_threshold)
-                    
-                    if is_high_entropy:
+                    if is_low_entropy_high_varentropy:
                         vals, inds = torch.topk(logp_T, k=min(branch_top_k, logp_T.shape[-1]))
                         pairs = list(zip(vals.tolist(), inds.tolist()))
                         pairs.sort(key=lambda x: (-x[0], x[1]))  # tie-break
                         cand_ids = [tid for _, tid in pairs]
-                        new_branch_steps_for_children = h.branch_steps + [steps]
                         branch_events += 1
                         total_branches_created += (len(cand_ids) - 1)
                         current_total_hyps += (len(cand_ids) - 1)
@@ -294,7 +407,6 @@ class KVBatchEGDT:
                 for tid in cand_ids:
                     child_tok_ids.append(tid)
                     child_parent_idx.append(idx)
-                    child_branch_steps.append(list(new_branch_steps_for_children))
                     
             if not child_tok_ids:
                 break
@@ -307,13 +419,14 @@ class KVBatchEGDT:
             out = self.model(input_ids=input_ids, past_key_values=batched_pkv, use_cache=True)
             child_logits = out.logits[:, -1, :]               # [B, vocab]
             child_pkv_list = _split_cache(out.past_key_values)
-
+            
+            del out
+            
             # 3) Materialize children; free parents
             next_active: List[Hyp] = []
             for i in range(B):
                 parent = active[child_parent_idx[i]]
                 tid = child_tok_ids[i]
-                bsteps_for_child = child_branch_steps[i]
 
                 # accumulate logprob from parent's distribution at T=1 
                 logits_i = parent.next_logits[0]
@@ -341,21 +454,41 @@ class KVBatchEGDT:
                 child_token_metrics = parent.token_metrics.copy()
                 child_token_metrics.append(current_token_detail)
 
+                child_answer = None
+                if done and answer_extractor is not None:
+                    decoded = decode_text(new_ids, skip_special_tokens=True)
+                    try:
+                        ans = answer_extractor(decoded)
+                    except Exception:
+                        ans = None
+                    if ans:
+                        child_answer = str(ans).strip()
+
                 child = Hyp(
                     ids=new_ids,
                     logprob=new_lp,
                     finished=done,
                     entropies=parent.entropies.copy(),
                     varentropies=parent.varentropies.copy(),
-                    branch_steps=bsteps_for_child,
                     token_metrics=child_token_metrics,
                     pkv=pkv_child,
                     next_logits=next_logits_child,
+                    answer=child_answer,   
                 )
                 if child.finished:
                     finished.append(child)
+                    if try_update_early_stop():
+                        break 
                 else:
                     next_active.append(child)
+
+            if early_stop_triggered:
+                for p in active:
+                    p.pkv = None
+                    p.next_logits = None
+                active = next_active
+                break
+
 
             # Free parents
             for p in active:
@@ -374,6 +507,17 @@ class KVBatchEGDT:
                 print(f"[KVBatchEGDT] Reached num_traces={num_traces}, "
                       f"stopping early at step {steps}.")
                 break
+            
+            if early_stop_triggered:
+                wa = early_stop_info.get("winner_answer", None)
+                wr = early_stop_info.get("winner_ratio", None)
+                nf = early_stop_info.get("num_finished_for_vote", None)
+                print(
+                    f"[KVBatchEGDT] Early-stop at step {steps}: "
+                    f"winner_answer={wa!r}, ratio={wr:.3f} over {nf} finished traces."
+                )
+                break
+
             if "child_logits" in locals():
                 del child_logits
             if "batched_pkv" in locals():
@@ -381,41 +525,31 @@ class KVBatchEGDT:
             if "input_ids" in locals():
                 del input_ids
 
-        # if finished:
-        #     finished_sorted = sorted(finished, key=lambda h: (len(h.ids), -h.logprob))
-        #     top_hyps = finished_sorted[:num_traces]
-        # else:
-        #     active_sorted = sorted(active, key=lambda h: (len(h.ids), -h.logprob))
-        #     top_hyps = active_sorted[:num_traces]
+            torch.cuda.empty_cache()
 
-        all_hyps = finished + active
+        if finished:
+            all_hyps = finished
+        else:
+            all_hyps = sorted(active, key=lambda h: h.logprob, reverse=True)[:num_traces]
 
         if not all_hyps:
             return {"text": "", "tokens": [], "traces": [], "stats": {"reason": "no_candidates"}}
-
-        def sort_key(h: Hyp):
-            return (0 if h.finished else 1, len(h.ids), -h.logprob)
-        
-        all_sorted = sorted(all_hyps, key=sort_key)
-        top_hyps = all_sorted
         
         traces = []
-        for h in top_hyps:
+        for h in all_hyps:
             traces.append({
                 "text": self.tok.decode(h.ids, skip_special_tokens=True),
                 "tokens": h.ids,
                 "logprob": h.logprob,
+                "finished": h.finished,
                 "length": len(h.ids),
                 "mean_entropy": (sum(h.entropies) / len(h.entropies)) if h.entropies else 0.0,
                 "entropy_history": h.entropies,
                 "varentropy_history": h.varentropies,
                 "token_metrics": h.token_metrics,
-                "branch_steps": h.branch_steps,
             })
 
-        for var in ["prompt_ids", "out0", "logits0"]:
-            if var in locals():
-                del locals()[var]
+        del prompt_ids, out0, logits0
 
         if "child_logits" in locals():
             del child_logits
@@ -424,21 +558,23 @@ class KVBatchEGDT:
         if "input_ids" in locals():
             del input_ids
 
+        
         torch.cuda.empty_cache()
-        return {
-            # "text": self.tok.decode(best.ids, skip_special_tokens=True),
-            # "tokens": best.ids,
-            "traces": traces,   
-            "stats": {
-                "num_steps": steps,
-                "num_finished": len(finished),
-                # "generated_len": len(best.ids),
-                # "mean_entropy_best": (sum(best.entropies)/len(best.entropies)) if best.entropies else 0.0,
-                "branch_events": branch_events,
-                "total_branches_created": total_branches_created,
-                "max_active_batch": max_active_batch,
-                "unfinished_left": len(active),
-                "all_token_metrics": all_token_metrics,
-                "num_traces": len(traces),
-            }
+        stats = {
+            "num_steps": steps,
+            "num_finished": len(finished),
+            "branch_events": branch_events,
+            "total_branches_created": total_branches_created,
+            "max_active_batch": max_active_batch,
+            "unfinished_left": len(active),
+            "all_token_metrics": all_token_metrics,
+            "num_traces": len(traces),
+            "early_stop": early_stop_triggered,
+            "early_stop_info": early_stop_info,
         }
+
+        return {
+            "traces": traces,
+            "stats": stats,
+        }
+
