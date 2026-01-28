@@ -33,13 +33,6 @@ datasets:
     answer_key: "answer"    
     prompt_tail: " Please reason step by step, and put your final answer within \\boxed{}."
 
-  "MATH500":
-    dataset_name: "HuggingFaceH4/MATH-500"
-    split: "test"
-    prompt_key: "problem"    
-    answer_key: "answer"     
-    prompt_tail: " Please reason step by step. At the end, output ALL required final answers inside a single LaTeX tuple inside ONE \\boxed{ }."
-
   "gpqa_diamond":
     dataset_name: "Idavidrein/gpqa"
     split: "train"
